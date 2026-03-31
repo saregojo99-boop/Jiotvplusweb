@@ -1,10 +1,13 @@
 document.addEventListener("DOMContentLoaded", () => {
   let channels = [];
+  let shakaPlayer = null;
 
   async function fetchChannels() {
     try {
       const res = await fetch("channels.json");
-      channels = await res.json();
+      const data = await res.json();
+      // Skip the first info object
+      channels = data.filter(ch => ch.id);
       renderFilters();
       renderChannels(channels);
     } catch (err) {
@@ -14,18 +17,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function renderFilters() {
     const catSet = new Set();
-    const langSet = new Set();
-    const genreSet = new Set();
-
-    channels.forEach(ch => {
-      if (ch.category) catSet.add(ch.category);
-      if (ch.language) langSet.add(ch.language);
-      if (ch.genre) genreSet.add(ch.genre);
-    });
-
+    channels.forEach(ch => { if (ch.category) catSet.add(ch.category); });
     fillSelect("categoryFilter", catSet);
-    fillSelect("languageFilter", langSet);
-    fillSelect("genreFilter", genreSet);
   }
 
   function fillSelect(id, values) {
@@ -44,94 +37,95 @@ document.addEventListener("DOMContentLoaded", () => {
     list.forEach(channel => {
       const card = document.createElement("div");
       card.className = "card";
-      const logoUrl = getLogoUrl(channel.name);
       card.innerHTML = `
-        <img src="${logoUrl}" alt="${channel.name}">
+        <img src="${channel.logo}" alt="${channel.name}" onerror="this.src='https://placehold.co/200x120?text=TV'">
         <h3>${channel.name}</h3>
         <span>${channel.category || 'Uncategorized'}</span>
       `;
-      card.onclick = () => playChannel(channel.url);
+      card.onclick = () => playChannel(channel);
       grid.appendChild(card);
     });
-  }
-
-  function getLogoUrl(channelName) {
-    const formattedName = channelName.replace(/\s+/g, '_').toLowerCase();
-    return `https://raw.githubusercontent.com/amjiddader/tv_logo/master/${formattedName}.png`;
   }
 
   function applyFilters() {
     const q = document.getElementById("search").value.toLowerCase();
     const cat = document.getElementById("categoryFilter").value;
-    const lang = document.getElementById("languageFilter").value;
-    const genre = document.getElementById("genreFilter").value;
-
     const filtered = channels.filter(ch =>
       (!q || ch.name.toLowerCase().includes(q)) &&
-      (!cat || ch.category === cat) &&
-      (!lang || ch.language === lang) &&
-      (!genre || ch.genre === genre)
+      (!cat || ch.category === cat)
     );
-
     renderChannels(filtered);
   }
 
-function playChannel(url) {
-  const wrapper = document.getElementById("playerWrapper");
+  async function playChannel(channel) {
+    const wrapper = document.getElementById("playerWrapper");
+    wrapper.classList.add("show");
 
-  const oldPlayer = document.getElementById("videoPlayer");
-  const newPlayer = oldPlayer.cloneNode(true);
-  oldPlayer.parentNode.replaceChild(newPlayer, oldPlayer);
+    const videoEl = document.getElementById("videoPlayer");
 
-  newPlayer.src = "";
-  newPlayer.load();
+    // Destroy previous player instance
+    if (shakaPlayer) {
+      await shakaPlayer.destroy();
+      shakaPlayer = null;
+    }
 
-  if (url.includes(".mpd")) {
-    const dash = dashjs.MediaPlayer().create();
-    dash.initialize(newPlayer, url, true);
-  } else if (url.includes(".m3u8")) {
-    newPlayer.src = url;
-    newPlayer.type = "application/x-mpegURL"; // This is important for m3u8 streams
-    newPlayer.load();
-  } else if (url.includes("php?id=") || url.includes("m3u8?id=")) {
-    // Handle php?id= and m3u8?id= streams by redirecting or fetching the actual stream URL
-    fetch(url)
-      .then(res => res.text())
-      .then(resText => {
-        // Assuming the response text contains a valid stream URL
-        const streamUrl = resText.trim();  // Make sure to extract the URL properly from the response
-        newPlayer.src = streamUrl;
-        newPlayer.load();
-      })
-      .catch(err => console.error("Error fetching stream URL:", err));
-  } else {
-    // If it's a direct URL or other format
-    newPlayer.src = url;
-    newPlayer.load();
+    shaka.polyfill.installAll();
+
+    if (!shaka.Player.isBrowserSupported()) {
+      alert("Your browser does not support DRM playback.");
+      return;
+    }
+
+    shakaPlayer = new shaka.Player(videoEl);
+
+    // Build DRM clearKeys config
+    const drmConfig = {};
+    if (channel.drm && channel.drm["null"] !== "null") {
+      drmConfig.clearKeys = channel.drm;
+    }
+
+    shakaPlayer.configure({
+      drm: drmConfig,
+      streaming: {
+        bufferingGoal: 30,
+        rebufferingGoal: 5,
+      }
+    });
+
+    // Inject required headers
+    shakaPlayer.getNetworkingEngine().registerRequestFilter((type, request) => {
+      if (channel.token) {
+        const sep = request.uris[0].includes('?') ? '&' : '?';
+        request.uris[0] += sep + channel.token;
+      }
+      if (channel.referer) request.headers['Referer'] = channel.referer;
+      if (channel.userAgent) request.headers['User-Agent'] = channel.userAgent;
+    });
+
+    try {
+      await shakaPlayer.load(channel.mpd);
+      await videoEl.play();
+    } catch (err) {
+      console.error("Playback error:", err);
+      alert("Failed to play this channel. It may require a server-side proxy for headers/DRM.");
+    }
   }
 
-  wrapper.classList.add("show");
-}
-
-  window.closePlayer = () => {
+  window.closePlayer = async () => {
     const wrapper = document.getElementById("playerWrapper");
-    const player = document.getElementById("videoPlayer");
     wrapper.classList.remove("show");
-    player.pause();
-    player.src = "";
+    if (shakaPlayer) {
+      await shakaPlayer.destroy();
+      shakaPlayer = null;
+    }
   };
 
-  // Event Listeners
   document.getElementById("search").addEventListener("input", applyFilters);
   document.getElementById("categoryFilter").addEventListener("change", applyFilters);
-  document.getElementById("languageFilter").addEventListener("change", applyFilters);
-  document.getElementById("genreFilter").addEventListener("change", applyFilters);
   document.getElementById("refresh").addEventListener("click", () => {
     fetchChannels();
     document.getElementById("search").value = "";
-    ["categoryFilter", "languageFilter", "genreFilter"].forEach(id => {
-      document.getElementById(id).value = "";
-    });
+    document.getElementById("categoryFilter").value = "";
   });
 
   fetchChannels();
